@@ -152,7 +152,9 @@ if (FAKECAM) {
   const draw = () => {
     const t = (performance.now() - t0) / 1000;
     cx.fillStyle = '#b8b4ac'; cx.fillRect(0, 0, cv.width, cv.height);
-    if (logoImg.complete) {
+    const lostAt = parseFloat(PARAMS.get('fakeloss') || '0'); // secs after detection; 0 = never lose
+    const sinceFound = window.__foundAt ? (performance.now() - window.__foundAt) / 1000 : -1;
+    if (logoImg.complete && !(lostAt && sinceFound > lostAt)) {
       const base = parseInt(PARAMS.get('fakesize') || '360', 10);
       const w = base + Math.sin(t * 0.7) * 10;
       const h = w * (logoImg.height / logoImg.width);
@@ -309,7 +311,10 @@ async function buildParticles() {
         vec4 mv = modelViewMatrix * vec4(p, 1.0);
         gl_Position = projectionMatrix * mv;
         float base = 3.0 + aRand * 3.5;
-        gl_PointSize = base * uPix * (1.0 / max(0.001, -mv.z)) * (0.35 + 0.65 * tIn);
+        // scale-aware sizing: MindAR poses carry large world scale at large distance,
+        // so point size must grow with the model-view scale or particles vanish in AR
+        float mvScale = length(vec3(modelViewMatrix[0][0], modelViewMatrix[0][1], modelViewMatrix[0][2]));
+        gl_PointSize = base * uPix * (mvScale / max(0.001, -mv.z)) * (0.35 + 0.65 * tIn);
         vColor = aColor * (1.0 + 0.7 * sw);
         vAlpha = tIn * (1.0 - tOut);
       }`,
@@ -503,9 +508,17 @@ async function prepareContent() {
   const [p, l] = await Promise.all([buildParticles(), buildLogo()]);
   contentGroup.add(p, l, buildConfetti());
 }
+// warm everything heavy while the user reads the primer: 3D content, the AR engine
+// module (2MB+ of JS to parse), and the compiled tracking target
+let contentPromise = null;
+const ensureContent = () => contentPromise || (contentPromise = prepareContent());
+ensureContent();
+const mindarModPromise = FLAT ? null : import('mindar-image-three').catch(() => null);
+if (!FLAT) fetch(BRAND.mindTarget).catch(() => {});
 
 async function bootAR() {
-  const { MindARThree } = await import('mindar-image-three');
+  const mod = (await mindarModPromise) || (await import('mindar-image-three'));
+  const { MindARThree } = mod;
   mindarThree = new MindARThree({
     container: $('app'),
     imageTargetSrc: BRAND.mindTarget,
@@ -519,35 +532,85 @@ async function bootAR() {
   const pmrem = new THREE.PMREMGenerator(renderer);
   scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
   scene.add(new THREE.AmbientLight(0xffffff, 0.4));
-  await prepareContent();
+  await ensureContent();
   anchor = mindarThree.addAnchor(0);
   anchor.group.add(contentGroup);
+  // Tracking on real phones flickers (glare, moiré, motion). The show must never
+  // depend on continuous tracking: it starts ON the logo, then lifts off into
+  // camera space for good. MindAR hides anchor.group on every loss — after this
+  // detach, that can't touch us.
+  // MindAR's camera has near=10 and its pose matrices carry large scale at large
+  // distance — so the ONLY safe detach pose is one MindAR itself produced. Capture
+  // the last good pose every tracked frame; the fallback default must also sit
+  // beyond the near plane with matching scale.
+  const lastGood = new THREE.Matrix4();
+  let haveLastGood = false;
+  const detachToCamera = () => {
+    if (detached) return;
+    detached = true;
+    const holder = new THREE.Group();
+    const pos = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
+    let usedDefault = true;
+    if (haveLastGood) {
+      lastGood.decompose(pos, q, s);
+      if (isFinite(pos.x) && pos.z < -camera.near) {
+        holder.position.copy(pos); holder.quaternion.copy(q); holder.scale.copy(s);
+        usedDefault = false;
+      }
+    }
+    if (usedDefault) { holder.position.set(0, 0, -30); holder.scale.setScalar(6); }
+    scene.add(holder);
+    holder.add(contentGroup);
+    contentGroup.position.set(0, 0, 0);
+    contentGroup.quaternion.identity();
+    contentGroup.scale.setScalar(1);
+    window.dbg && window.dbg('detached' + (usedDefault ? ' (default pose)' : ' (last tracked pose)'));
+  };
   anchor.onTargetFound = () => {
     window.dbg && window.dbg('TARGET FOUND');
     window.__found = true;
+    window.__foundAt = window.__foundAt || performance.now();
     $('scan').classList.add('hidden');
-    startShow();
+    if (showClock === null) {
+      startShow();
+      setTimeout(detachToCamera, T.swirl * 1000); // lift-off moment
+    }
   };
   anchor.onTargetLost = () => {
     window.dbg && window.dbg('target lost');
-    // past the burst? keep the show alive where it was, in world space
-    if (showClock !== null && showClock > T.burst && !detached) {
-      detached = true;
-      anchor.group.updateMatrixWorld(true);
-      const holder = new THREE.Group();
-      holder.matrixAutoUpdate = false;
-      holder.matrix.copy(contentGroup.matrixWorld);
-      scene.add(holder);
-      holder.attach(contentGroup);
-    }
+    // lost before the lift-off moment: detach immediately so the show stays visible
+    if (showClock !== null) detachToCamera();
   };
   await mindarThree.start();
+  window.__snapAR = () => { renderer.render(scene, camera); return renderer.domElement.toDataURL('image/png'); };
+  window.__scene = scene; window.__camera = camera; window.__renderer = renderer;
+  window.__probe = () => {
+    const p = new THREE.Vector3();
+    contentGroup.getWorldPosition(p);
+    return {
+      camPos: camera.position.toArray().map(v => +v.toFixed(3)),
+      camRot: camera.rotation.toArray().slice(0, 3).map(v => typeof v === 'number' ? +v.toFixed(3) : v),
+      camFov: camera.fov,
+      contentWorld: p.toArray().map(v => +v.toFixed(3)),
+      contentParent: contentGroup.parent && (contentGroup.parent === scene ? 'scene' : contentGroup.parent.type),
+      parentVisible: contentGroup.parent ? contentGroup.parent.visible : null,
+      chainVisible: (() => { let n = contentGroup, out = []; while (n) { out.push(n.visible); n = n.parent; } return out; })(),
+      logoVisible: logoGroup.visible, logoScale: +logoGroup.scale.x.toFixed(3),
+      particlesVisible: particles.visible,
+      showT: showClock === null ? null : +showClock.toFixed(1),
+    };
+  };
   window.dbg && window.dbg('mindar started, video=' + (mindarThree.video ? mindarThree.video.videoWidth + 'x' + mindarThree.video.videoHeight : 'none'));
   $('scan').classList.remove('hidden');
   setTimeout(() => $('noCardBtn').classList.add('show'), 7000);
   let last = performance.now();
   renderer.setAnimationLoop(() => {
     const now = performance.now(); const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    if (!detached && anchor.group.visible) {
+      contentGroup.updateMatrixWorld(true);
+      lastGood.copy(contentGroup.matrixWorld);
+      haveLastGood = true;
+    }
     tick(dt);
     renderer.render(scene, camera);
   });
@@ -561,7 +624,7 @@ async function bootFlat() {
   makeRenderer($('app'));
   scene.add(new THREE.AmbientLight(0xffffff, 0.45));
   const key = new THREE.DirectionalLight(0xfff2cc, 1.1); key.position.set(1, 2, 2); scene.add(key);
-  await prepareContent();
+  await ensureContent();
   scene.add(contentGroup);
   addEventListener('resize', () => {
     camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
@@ -580,16 +643,15 @@ async function bootFlat() {
   startShow();
 }
 
-/* fallback inside AR: run the show fixed in front of the camera */
+/* fallback inside AR: run the show fixed in front of the camera (past MindAR's near=10 plane) */
 function noCardFallback() {
   if (!mindarThree || showClock !== null) return;
   $('scan').classList.add('hidden');
   detached = true;
   const holder = new THREE.Group();
-  holder.position.set(0, 0, -1.15);
-  holder.scale.setScalar(0.9);
-  camera.add(holder);
-  scene.add(camera);
+  holder.position.set(0, 0, -30);
+  holder.scale.setScalar(6);
+  scene.add(holder);
   holder.add(contentGroup);
   startShow();
 }
