@@ -74,7 +74,7 @@
 
 <div id="scan" class="overlay hidden">
   <div class="frame"></div>
-  <div class="tip">Point your camera at the <b>Seminole Hard Rock logo</b> — on the card we sent, a screen, or anywhere you see it.</div>
+  <div class="tip"><img src="assets/logo-display.png" alt="" style="width:84px;display:block;margin:0 auto 8px;background:#fff;border-radius:8px;padding:6px;">Point your camera at <b>this logo</b> — on the card we sent, a screen, or anywhere you see it.</div>
   <button id="noCardBtn">No logo around? Watch it here</button>
 </div>
 
@@ -122,8 +122,52 @@ const BRAND = {
 const PARAMS = new URLSearchParams(location.search);
 const FLAT = PARAMS.has('flat');
 const HEADLESS = PARAMS.has('headless'); // QA: run without compositing (rAF shim + frame grab)
+const DEBUG = PARAMS.has('debug');       // QA: on-screen log overlay (phone debugging)
+const FAKECAM = PARAMS.has('fakecam');   // QA: synthetic camera showing the logo (detection positive control)
 if (HEADLESS) window.requestAnimationFrame = cb => setTimeout(() => cb(performance.now()), 16);
 const $ = id => document.getElementById(id);
+
+const dbgLines = [];
+window.dbg = (m) => {
+  if (!DEBUG && !HEADLESS) return;
+  dbgLines.push(m); if (dbgLines.length > 14) dbgLines.shift();
+  let el = document.getElementById('dbg');
+  if (!el && DEBUG) {
+    el = document.createElement('div'); el.id = 'dbg';
+    el.style.cssText = 'position:fixed;top:60px;left:8px;right:8px;z-index:99;background:rgba(0,0,0,.6);color:#0f0;font:11px monospace;padding:6px;border-radius:6px;pointer-events:none;white-space:pre-wrap;';
+    document.body.appendChild(el);
+  }
+  if (el) el.textContent = dbgLines.join('\n');
+  console.log('[dbg]', m);
+};
+addEventListener('error', e => window.dbg('ERR ' + e.message));
+addEventListener('unhandledrejection', e => window.dbg('REJ ' + (e.reason && e.reason.message || e.reason)));
+
+if (FAKECAM) {
+  // synthetic camera: a canvas stream showing the printed logo with gentle drift
+  const logoImg = new Image(); logoImg.src = 'assets/logo-1000.png';
+  const cv = document.createElement('canvas'); cv.width = 480; cv.height = 640;
+  const cx = cv.getContext('2d');
+  let t0 = performance.now();
+  const draw = () => {
+    const t = (performance.now() - t0) / 1000;
+    cx.fillStyle = '#b8b4ac'; cx.fillRect(0, 0, cv.width, cv.height);
+    if (logoImg.complete) {
+      const base = parseInt(PARAMS.get('fakesize') || '360', 10);
+      const w = base + Math.sin(t * 0.7) * 10;
+      const h = w * (logoImg.height / logoImg.width);
+      cx.save();
+      cx.translate(cv.width / 2 + Math.sin(t * 0.9) * 6, cv.height / 2 + Math.cos(t * 1.1) * 5);
+      cx.rotate(Math.sin(t * 0.5) * 0.02);
+      cx.drawImage(logoImg, -w / 2, -h / 2, w, h);
+      cx.restore();
+    }
+    setTimeout(draw, 50);
+  };
+  draw();
+  const stream = cv.captureStream(20);
+  navigator.mediaDevices.getUserMedia = async () => { window.dbg('fakecam getUserMedia'); return stream; };
+}
 
 /* ================= audio: tiny procedural sound design ================= */
 class Sound {
@@ -479,10 +523,13 @@ async function bootAR() {
   anchor = mindarThree.addAnchor(0);
   anchor.group.add(contentGroup);
   anchor.onTargetFound = () => {
+    window.dbg && window.dbg('TARGET FOUND');
+    window.__found = true;
     $('scan').classList.add('hidden');
     startShow();
   };
   anchor.onTargetLost = () => {
+    window.dbg && window.dbg('target lost');
     // past the burst? keep the show alive where it was, in world space
     if (showClock !== null && showClock > T.burst && !detached) {
       detached = true;
@@ -495,6 +542,7 @@ async function bootAR() {
     }
   };
   await mindarThree.start();
+  window.dbg && window.dbg('mindar started, video=' + (mindarThree.video ? mindarThree.video.videoWidth + 'x' + mindarThree.video.videoHeight : 'none'));
   $('scan').classList.remove('hidden');
   setTimeout(() => $('noCardBtn').classList.add('show'), 7000);
   let last = performance.now();
