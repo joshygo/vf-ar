@@ -154,7 +154,9 @@ if (FAKECAM) {
     cx.fillStyle = '#b8b4ac'; cx.fillRect(0, 0, cv.width, cv.height);
     const lostAt = parseFloat(PARAMS.get('fakeloss') || '0'); // secs after detection; 0 = never lose
     const sinceFound = window.__foundAt ? (performance.now() - window.__foundAt) / 1000 : -1;
-    if (logoImg.complete && !(lostAt && sinceFound > lostAt)) {
+    const backAt = parseFloat(PARAMS.get('fakeback') || '0'); // secs after detection; logo returns
+    const hidden = lostAt && sinceFound > lostAt && !(backAt && sinceFound > backAt);
+    if (logoImg.complete && !hidden) {
       const base = parseInt(PARAMS.get('fakesize') || '360', 10);
       const w = base + Math.sin(t * 0.7) * 10;
       const h = w * (logoImg.height / logoImg.width);
@@ -523,8 +525,8 @@ async function bootAR() {
     container: $('app'),
     imageTargetSrc: BRAND.mindTarget,
     uiScanning: 'no', uiLoading: 'no', uiError: 'no',
-    filterMinCF: 0.0001, filterBeta: 0.003,   // smoothing: fight the jitter
-    warmupTolerance: 2, missTolerance: 8,
+    filterMinCF: 0.001, filterBeta: 1000,     // MindAR-tuned one-euro defaults (heavier smoothing = visible lag)
+    warmupTolerance: 2, missTolerance: 15,
   });
   ({ renderer, scene, camera } = mindarThree);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -535,51 +537,47 @@ async function bootAR() {
   await ensureContent();
   anchor = mindarThree.addAnchor(0);
   anchor.group.add(contentGroup);
-  // Tracking on real phones flickers (glare, moiré, motion). The show must never
-  // depend on continuous tracking: it starts ON the logo, then lifts off into
-  // camera space for good. MindAR hides anchor.group on every loss — after this
-  // detach, that can't touch us.
-  // MindAR's camera has near=10 and its pose matrices carry large scale at large
-  // distance — so the ONLY safe detach pose is one MindAR itself produced. Capture
-  // the last good pose every tracked frame; the fallback default must also sit
-  // beyond the near plane with matching scale.
+  // REAL anchoring: content lives in anchor.group (locked to the logo) the whole time.
+  // On a tracking dropout MindAR hides anchor.group, so we freeze the content at its
+  // last good pose in camera space instead of letting it vanish; the moment the logo
+  // is re-found it snaps back onto the anchor. (MindAR camera near=10 and pose
+  // matrices carry large scale — only MindAR-produced poses are safe to reuse.)
   const lastGood = new THREE.Matrix4();
   let haveLastGood = false;
-  const detachToCamera = () => {
+  let holder = null;
+  const resetLocal = () => { contentGroup.position.set(0, 0, 0); contentGroup.quaternion.identity(); contentGroup.scale.setScalar(1); };
+  const freezeAtLastPose = () => {
     if (detached) return;
     detached = true;
-    const holder = new THREE.Group();
+    holder = new THREE.Group();
     const pos = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
     let usedDefault = true;
     if (haveLastGood) {
       lastGood.decompose(pos, q, s);
-      if (isFinite(pos.x) && pos.z < -camera.near) {
-        holder.position.copy(pos); holder.quaternion.copy(q); holder.scale.copy(s);
-        usedDefault = false;
-      }
+      if (isFinite(pos.x) && pos.z < -camera.near) { holder.position.copy(pos); holder.quaternion.copy(q); holder.scale.copy(s); usedDefault = false; }
     }
     if (usedDefault) { holder.position.set(0, 0, -30); holder.scale.setScalar(6); }
-    scene.add(holder);
-    holder.add(contentGroup);
-    contentGroup.position.set(0, 0, 0);
-    contentGroup.quaternion.identity();
-    contentGroup.scale.setScalar(1);
-    window.dbg && window.dbg('detached' + (usedDefault ? ' (default pose)' : ' (last tracked pose)'));
+    scene.add(holder); holder.add(contentGroup); resetLocal();
+    window.dbg && window.dbg('frozen at ' + (usedDefault ? 'default pose' : 'last tracked pose'));
   };
+  const reattachToAnchor = () => {
+    if (!detached) return;
+    detached = false;
+    anchor.group.add(contentGroup); resetLocal();
+    if (holder) { scene.remove(holder); holder = null; }
+    window.dbg && window.dbg('re-anchored to logo');
+  };
+  window.__freezeDefault = () => freezeAtLastPose();
   anchor.onTargetFound = () => {
     window.dbg && window.dbg('TARGET FOUND');
     window.__found = true;
     window.__foundAt = window.__foundAt || performance.now();
     $('scan').classList.add('hidden');
-    if (showClock === null) {
-      startShow();
-      setTimeout(detachToCamera, T.swirl * 1000); // lift-off moment
-    }
+    if (showClock === null) startShow(); else reattachToAnchor();
   };
   anchor.onTargetLost = () => {
     window.dbg && window.dbg('target lost');
-    // lost before the lift-off moment: detach immediately so the show stays visible
-    if (showClock !== null) detachToCamera();
+    if (showClock !== null) freezeAtLastPose();
   };
   await mindarThree.start();
   window.__snapAR = () => { renderer.render(scene, camera); return renderer.domElement.toDataURL('image/png'); };
@@ -647,12 +645,7 @@ async function bootFlat() {
 function noCardFallback() {
   if (!mindarThree || showClock !== null) return;
   $('scan').classList.add('hidden');
-  detached = true;
-  const holder = new THREE.Group();
-  holder.position.set(0, 0, -30);
-  holder.scale.setScalar(6);
-  scene.add(holder);
-  holder.add(contentGroup);
+  window.__freezeDefault && window.__freezeDefault();
   startShow();
 }
 
