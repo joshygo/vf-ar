@@ -69,7 +69,7 @@
   <h1>Something extraordinary is hiding in your logo.</h1>
   <p class="sub">A 30-second augmented-reality moment, built exclusively for Seminole Hard Rock. Allow camera access when asked — that's the window it appears through.</p>
   <button id="enterBtn">REVEAL IT</button>
-  <div class="fineprint">CRAFTED BY VIRTUAL FUDGE · build 2026-08-22.4</div>
+  <div class="fineprint">CRAFTED BY VIRTUAL FUDGE · build 2026-08-22.5</div>
 </div>
 
 <div id="scan" class="overlay hidden">
@@ -127,8 +127,10 @@ const FAKECAM = PARAMS.has('fakecam');   // QA: synthetic camera showing the log
 // Anchored-overlay tuning (URL-overridable for on-phone A/B: ?scale=1.12&lift=0.1&mincf=0.001&beta=1000)
 const AR_OVERLAY_SCALE = parseFloat(PARAMS.get('scale') || '1.1');   // replica slightly larger than the real logo
 const AR_OVERLAY_LIFT  = parseFloat(PARAMS.get('lift')  || '0.08');  // floats in front of the surface (logo-widths)
-const FILTER_MIN_CF    = parseFloat(PARAMS.get('mincf') || '0.001'); // one-euro: lower = calmer at rest, more lag
-const FILTER_BETA      = parseFloat(PARAMS.get('beta')  || '1000');  // one-euro: higher = tracks fast motion, more jitter
+const FILTER_MIN_CF    = parseFloat(PARAMS.get('mincf') || '0.0005'); // one-euro: lower = calmer at rest, more lag
+const FILTER_BETA      = parseFloat(PARAMS.get('beta')  || '200');
+const CAM_W = parseInt(PARAMS.get('res') || '1280', 10);            // camera capture width; tracker precision scales with it
+const MIN_ELEMENT_FRAC = parseFloat(PARAMS.get('minel') || '0.07'); // logo elements shorter than this × logo height stay REAL (no 3D)  // one-euro: higher = tracks fast motion, more jitter
 if (HEADLESS) window.requestAnimationFrame = cb => setTimeout(() => cb(performance.now()), 16);
 const $ = id => document.getElementById(id);
 
@@ -373,6 +375,9 @@ async function buildLogo() {
     // trace background = large near-WHITE regions only (the logo's own dark art can
     // legitimately span most of the canvas as one connected shape — never area-filter it)
     if (hsl.l > 0.9 && hsl.s < 0.15 && areaRatio > 0.05) return;
+    // tiny elements (fine print, small lettering) can't carry a 3D overlay at phone
+    // tracking precision — leave them REAL on the surface (partial augmentation)
+    if (h < fullH * MIN_ELEMENT_FRAC && w < fullW * 0.5) return;
     const key = '#' + e.color.getHexString();
     if (!byColor.has(key)) byColor.set(key, []);
     byColor.get(key).push({ shape: e.shape, order });
@@ -533,6 +538,13 @@ if (!FLAT) fetch(BRAND.mindTarget).catch(() => {});
 async function bootAR() {
   const mod = (await mindarModPromise) || (await import('mindar-image-three'));
   const { MindARThree } = mod;
+  if (!FAKECAM && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    const gum = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+    navigator.mediaDevices.getUserMedia = (c) => {
+      const video = Object.assign({}, (c && c.video) || {}, { width: { ideal: CAM_W }, height: { ideal: Math.round(CAM_W * 9 / 16) }, frameRate: { ideal: 30 } });
+      return gum({ audio: false, video });
+    };
+  }
   mindarThree = new MindARThree({
     container: $('app'),
     imageTargetSrc: BRAND.mindTarget,
