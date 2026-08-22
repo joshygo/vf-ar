@@ -124,6 +124,11 @@ const FLAT = PARAMS.has('flat');
 const HEADLESS = PARAMS.has('headless'); // QA: run without compositing (rAF shim + frame grab)
 const DEBUG = PARAMS.has('debug');       // QA: on-screen log overlay (phone debugging)
 const FAKECAM = PARAMS.has('fakecam');   // QA: synthetic camera showing the logo (detection positive control)
+// Anchored-overlay tuning (URL-overridable for on-phone A/B: ?scale=1.12&lift=0.1&mincf=0.001&beta=1000)
+const AR_OVERLAY_SCALE = parseFloat(PARAMS.get('scale') || '1.1');   // replica slightly larger than the real logo
+const AR_OVERLAY_LIFT  = parseFloat(PARAMS.get('lift')  || '0.08');  // floats in front of the surface (logo-widths)
+const FILTER_MIN_CF    = parseFloat(PARAMS.get('mincf') || '0.001'); // one-euro: lower = calmer at rest, more lag
+const FILTER_BETA      = parseFloat(PARAMS.get('beta')  || '1000');  // one-euro: higher = tracks fast motion, more jitter
 if (HEADLESS) window.requestAnimationFrame = cb => setTimeout(() => cb(performance.now()), 16);
 const $ = id => document.getElementById(id);
 
@@ -495,10 +500,17 @@ function tick(dt) {
     // elastic pop-in
     const k = Math.min(1, (t - T.reveal) / 0.9);
     const e = 1 + Math.pow(2, -8 * k) * Math.sin((k * 8 - 0.75) * 2.094) * (k < 1 ? 1 : 0);
-    logoGroup.scale.setScalar(0.2 + 0.8 * (k >= 1 ? 1 : e * k));
+    const baseScale = FLAT ? 1 : AR_OVERLAY_SCALE;
+    logoGroup.scale.setScalar(baseScale * (0.2 + 0.8 * (k >= 1 ? 1 : e * k)));
     spinImpulse *= (1 - 1.8 * dt);
-    logoGroup.rotation.y = Math.sin(t * 0.5) * 0.16 + spinImpulse;
-    logoGroup.position.z = 0.05 + Math.sin(t * 0.9) * 0.012;
+    if (FLAT) {
+      logoGroup.rotation.y = Math.sin(t * 0.5) * 0.16 + spinImpulse;
+      logoGroup.position.z = 0.05 + Math.sin(t * 0.9) * 0.012;
+    } else {
+      // anchored: NO idle sway — any motion against the static real logo reads as tracking error
+      logoGroup.rotation.y = spinImpulse;
+      logoGroup.position.z = AR_OVERLAY_LIFT;
+    }
   }
   if (t > T.reveal + 1.2 && particles.visible) particles.visible = false;
   stepConfetti(dt);
@@ -525,7 +537,7 @@ async function bootAR() {
     container: $('app'),
     imageTargetSrc: BRAND.mindTarget,
     uiScanning: 'no', uiLoading: 'no', uiError: 'no',
-    filterMinCF: 0.001, filterBeta: 1000,     // MindAR-tuned one-euro defaults (heavier smoothing = visible lag)
+    filterMinCF: FILTER_MIN_CF, filterBeta: FILTER_BETA,
     warmupTolerance: 2, missTolerance: 15,
   });
   ({ renderer, scene, camera } = mindarThree);
