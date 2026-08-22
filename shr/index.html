@@ -69,7 +69,7 @@
   <h1>Something extraordinary is hiding in your logo.</h1>
   <p class="sub">A 30-second augmented-reality moment, built exclusively for Seminole Hard Rock. Allow camera access when asked — that's the window it appears through.</p>
   <button id="enterBtn">REVEAL IT</button>
-  <div class="fineprint">CRAFTED BY VIRTUAL FUDGE · build 2026-08-22.5</div>
+  <div class="fineprint">CRAFTED BY VIRTUAL FUDGE · build 2026-08-22.6</div>
 </div>
 
 <div id="scan" class="overlay hidden">
@@ -131,6 +131,12 @@ const FILTER_MIN_CF    = parseFloat(PARAMS.get('mincf') || '0.0005'); // one-eur
 const FILTER_BETA      = parseFloat(PARAMS.get('beta')  || '200');
 const CAM_W = parseInt(PARAMS.get('res') || '1280', 10);            // camera capture width; tracker precision scales with it
 const MIN_ELEMENT_FRAC = parseFloat(PARAMS.get('minel') || '0.07'); // logo elements shorter than this × logo height stay REAL (no 3D)  // one-euro: higher = tracks fast motion, more jitter
+// --- v2 spikes (flag-gated; defaults untouched) ---
+const ROUTEA = PARAMS.has('routea');  // camera feed drawn INSIDE WebGL (VideoTexture quad) instead of the DOM <video> — gate for all post-FX/refraction/env-map effects
+const SHADOW = PARAMS.has('shadow');  // shadow catcher: 3D logo casts a soft shadow onto the real page
+const SHADOW_ALPHA = parseFloat(PARAMS.get('shadowa') || '0.35');
+const SHADOW_RES   = parseInt(PARAMS.get('shadowres') || '1024', 10);
+const SHOW_FPS = PARAMS.has('fps');   // frame-time HUD for on-phone cost measurement
 if (HEADLESS) window.requestAnimationFrame = cb => setTimeout(() => cb(performance.now()), 16);
 const $ = id => document.getElementById(id);
 
@@ -227,6 +233,111 @@ class Sound {
   pop() { this.ping(880 + Math.random() * 600, 0, 0.12, 0.1); }
 }
 const sound = new Sound();
+
+/* ================= Route A: camera feed as a WebGL texture =================
+   MindAR composites via a DOM <video> at z-index -2 behind an alpha renderer, so
+   no shader can ever touch the real world. Route A hides that video and re-draws
+   it inside WebGL as a fullscreen triangle whose UV crop replicates MindAR's own
+   cover-fit (from its resize(): videoAspect>containerAspect => fit height, crop
+   width, centered; else fit width, crop height). Match it exactly or the tracked
+   overlay drifts off the real logo. */
+function buildCameraBackdrop(video, container) {
+  const tex = new THREE.VideoTexture(video);
+  // no color-space conversion anywhere: sRGB bytes in, sRGB bytes out = byte parity with the DOM video
+  tex.colorSpace = THREE.NoColorSpace;
+  tex.minFilter = THREE.LinearFilter; tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3));
+  const mat = new THREE.ShaderMaterial({
+    depthTest: false, depthWrite: false,
+    uniforms: {
+      uMap: { value: tex },
+      uVideoAspect: { value: 4 / 3 },
+      uScreenAspect: { value: 1 },
+    },
+    vertexShader: `
+      varying vec2 vUv;
+      void main() { vUv = position.xy * 0.5 + 0.5; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
+    fragmentShader: `
+      uniform sampler2D uMap; uniform float uVideoAspect; uniform float uScreenAspect;
+      varying vec2 vUv;
+      void main() {
+        vec2 uv = vUv;
+        if (uVideoAspect > uScreenAspect) uv.x = 0.5 + (vUv.x - 0.5) * (uScreenAspect / uVideoAspect);
+        else                              uv.y = 0.5 + (vUv.y - 0.5) * (uVideoAspect / uScreenAspect);
+        gl_FragColor = texture2D(uMap, uv);
+      }`,
+  });
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.frustumCulled = false;
+  mesh.renderOrder = -10; // opaque pass, first — everything else draws over it
+  mesh.userData.update = () => {
+    // force the upload: three's VideoTexture waits on requestVideoFrameCallback,
+    // which never fires in a non-composited tab (headless QA) and adds a frame of
+    // latency vs the tracker; per-frame upload is also the cost we're measuring
+    tex.needsUpdate = true;
+    if (video.videoWidth) mat.uniforms.uVideoAspect.value = video.videoWidth / video.videoHeight;
+    mat.uniforms.uScreenAspect.value = container.clientWidth / Math.max(1, container.clientHeight);
+  };
+  return mesh;
+}
+
+/* ================= shadow catcher: 3D logo shades the real page ================= */
+let shadowLight = null; // shadow camera is world-space sized; MindAR poses carry ~1000x world scale, so tick() rescales it to the anchor every frame
+function buildShadowRig() {
+  // everything anchor-local: light hangs above the printed page and moves with it
+  const rig = new THREE.Group();
+  const catcher = new THREE.Mesh(
+    new THREE.PlaneGeometry(1.6, 1.6 / BRAND.logoAspect),
+    new THREE.ShadowMaterial({ opacity: SHADOW_ALPHA })
+  );
+  catcher.receiveShadow = true;
+  catcher.position.z = 0.001;
+  const light = new THREE.DirectionalLight(0xffffff, 0.7);
+  light.position.set(0.35, 0.9, 1.3);
+  light.castShadow = true;
+  light.shadow.mapSize.set(SHADOW_RES, SHADOW_RES);
+  const sc = light.shadow.camera;
+  sc.left = -1.2; sc.right = 1.2; sc.top = 1.2; sc.bottom = -1.2; sc.near = 0.1; sc.far = 5;
+  light.shadow.radius = 4;
+  light.shadow.bias = -0.0005;
+  rig.add(catcher, light, light.target);
+  shadowLight = light;
+  return rig;
+}
+const _shadowScaleV = new THREE.Vector3();
+function fitShadowCameraToAnchor() {
+  if (!shadowLight || !contentGroup) return;
+  _shadowScaleV.setFromMatrixColumn(contentGroup.matrixWorld, 0);
+  const s = _shadowScaleV.length();
+  const sc = shadowLight.shadow.camera;
+  if (Math.abs(sc.right - 1.2 * s) / (1.2 * s) < 0.01) return; // unchanged
+  sc.left = -1.2 * s; sc.right = 1.2 * s; sc.top = 1.2 * s; sc.bottom = -1.2 * s;
+  sc.near = 0.1 * s; sc.far = 5 * s;
+  sc.updateProjectionMatrix();
+}
+function enableShadowCasters(root) {
+  root.traverse(o => { if (o.isMesh && !o.isPoints && o.material && !(o.material instanceof THREE.ShadowMaterial)) o.castShadow = true; });
+}
+
+/* ================= frame-time HUD (?fps=1) ================= */
+function startFpsHud(getRenderer) {
+  const el = document.createElement('div');
+  el.style.cssText = 'position:fixed;top:calc(14px + env(safe-area-inset-top));left:14px;z-index:99;background:rgba(0,0,0,.6);color:#0f0;font:12px monospace;padding:5px 9px;border-radius:6px;pointer-events:none;';
+  document.body.appendChild(el);
+  let frames = 0, acc = 0, last = performance.now();
+  return () => {
+    const now = performance.now(); acc += now - last; last = now; frames++;
+    if (acc >= 500) {
+      const ms = acc / frames;
+      const r = getRenderer();
+      const ver = r ? (r.capabilities.isWebGL2 ? 'GL2' : 'GL1') : '?';
+      el.textContent = `${(1000 / ms).toFixed(0)} fps · ${ms.toFixed(1)} ms · ${ver}` + (ROUTEA ? ' · routeA' : '') + (SHADOW ? ' · shadow' : '');
+      frames = 0; acc = 0;
+    }
+  };
+}
 
 /* ================= three.js scene ================= */
 let renderer, scene, camera, mindarThree = null, anchor = null;
@@ -496,6 +607,7 @@ function resetShow() {
 }
 
 function tick(dt) {
+  fitShadowCameraToAnchor();
   if (showClock === null) return;
   showClock += dt;
   const t = showClock;
@@ -555,10 +667,12 @@ async function bootAR() {
   ({ renderer, scene, camera } = mindarThree);
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
+  if (SHADOW) { renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap; }
   const pmrem = new THREE.PMREMGenerator(renderer);
   scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
   scene.add(new THREE.AmbientLight(0xffffff, 0.4));
   await ensureContent();
+  if (SHADOW) { contentGroup.add(buildShadowRig()); enableShadowCasters(contentGroup); }
   anchor = mindarThree.addAnchor(0);
   anchor.group.add(contentGroup);
   // REAL anchoring: content lives in anchor.group (locked to the logo) the whole time.
@@ -604,6 +718,14 @@ async function bootAR() {
     if (showClock !== null) freezeAtLastPose();
   };
   await mindarThree.start();
+  let backdrop = null;
+  if (ROUTEA && mindarThree.video) {
+    backdrop = buildCameraBackdrop(mindarThree.video, $('app'));
+    scene.add(backdrop);
+    // visibility (not display): iOS keeps hidden-but-laid-out videos decoding
+    mindarThree.video.style.visibility = 'hidden';
+    window.dbg && window.dbg('routeA: camera feed in WebGL, DOM video hidden');
+  }
   window.__snapAR = () => { renderer.render(scene, camera); return renderer.domElement.toDataURL('image/png'); };
   window.__scene = scene; window.__camera = camera; window.__renderer = renderer;
   window.__probe = () => {
@@ -626,6 +748,7 @@ async function bootAR() {
   $('scan').classList.remove('hidden');
   setTimeout(() => $('noCardBtn').classList.add('show'), 7000);
   let last = performance.now();
+  const fpsTick = (SHOW_FPS || DEBUG) ? startFpsHud(() => renderer) : null;
   renderer.setAnimationLoop(() => {
     const now = performance.now(); const dt = Math.min(0.05, (now - last) / 1000); last = now;
     if (!detached && anchor.group.visible) {
@@ -633,8 +756,10 @@ async function bootAR() {
       lastGood.copy(contentGroup.matrixWorld);
       haveLastGood = true;
     }
+    if (backdrop) backdrop.userData.update();
     tick(dt);
     renderer.render(scene, camera);
+    if (fpsTick) fpsTick();
   });
 }
 
@@ -644,9 +769,11 @@ async function bootFlat() {
   camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.01, 50);
   camera.position.set(0, 0, 1.35);
   makeRenderer($('app'));
+  if (SHADOW) { renderer.shadowMap.enabled = true; renderer.shadowMap.type = THREE.PCFSoftShadowMap; }
   scene.add(new THREE.AmbientLight(0xffffff, 0.45));
   const key = new THREE.DirectionalLight(0xfff2cc, 1.1); key.position.set(1, 2, 2); scene.add(key);
   await ensureContent();
+  if (SHADOW) { contentGroup.add(buildShadowRig()); enableShadowCasters(contentGroup); }
   scene.add(contentGroup);
   addEventListener('resize', () => {
     camera.aspect = innerWidth / innerHeight; camera.updateProjectionMatrix();
@@ -655,12 +782,14 @@ async function bootFlat() {
   let last = performance.now();
   let px = 0, py = 0;
   addEventListener('pointermove', e => { px = (e.clientX / innerWidth - 0.5); py = (e.clientY / innerHeight - 0.5); });
+  const fpsTick = (SHOW_FPS || DEBUG) ? startFpsHud(() => renderer) : null;
   renderer.setAnimationLoop(() => {
     const now = performance.now(); const dt = Math.min(0.05, (now - last) / 1000); last = now;
     tick(dt);
     contentGroup.rotation.y += ((px * 0.5) - contentGroup.rotation.y) * 0.05;
     contentGroup.rotation.x += ((py * 0.3) - contentGroup.rotation.x) * 0.05;
     renderer.render(scene, camera);
+    if (fpsTick) fpsTick();
   });
   startShow();
 }
